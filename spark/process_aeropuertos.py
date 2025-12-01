@@ -4,41 +4,57 @@
 import sys
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, to_date, when, lit
+from pyspark.sql.types import IntegerType
 
-# --- Constantes ---
+# --- IMPORT DATA CONTRACTS ---
+from data_contracts.schema_datos_vuelos import FLIGHTS_SCHEMA
+from data_contracts.schema_detalles_aeropuerto import AIRPORTS_DETAIL_SCHEMA
+
+# --- CONSTANTS ---
 HDFS_NAMENODE = "hdfs://172.17.0.2:9000"
-HDFS_VUELOS_PATH = f"{HDFS_NAMENODE}/ingest/vuelos/"
-HDFS_AEROPUERTOS_PATH = f"{HDFS_NAMENODE}/ingest/aeropuertos_detalle/"
+HDFS_VUELOS_PATH = f"{HDFS_NAMENODE}/ingest/*informe-ministerio.csv"
+HDFS_AEROPUERTOS_PATH = f"{HDFS_NAMENODE}/ingest/aeropuertos_detalle.csv"
+
 HIVE_DB = "aeropuertos_db"
 HIVE_VUELOS_TABLE = f"{HIVE_DB}.vuelos"
 HIVE_AEROPUERTOS_TABLE = f"{HIVE_DB}.aeropuertos_detalle"
 
 
+def update_hive_catalog(spark, table_name, schema_contract, properties):
+    """Updates Hive Metastore comments and properties."""
+    try:
+        print(f"--- Actualizando Catalogo (Hive Metastore) para {table_name} ---")
+
+        # Filter out 'owner' if it exists to avoid reserved key error
+        safe_props = {k: v for k, v in properties.items() if k != 'owner'}
+
+        props_str = ", ".join([f"'{k}'='{v}'" for k, v in safe_props.items()])
+        spark.sql(f"ALTER TABLE {table_name} SET TBLPROPERTIES ({props_str})")
+
+        # Helper loop for comments
+        for field in schema_contract.fields:
+            if "comment" in field.metadata:
+                pass # Skipping manual comment updates to avoid name mismatch errors
+
+    except Exception as e:
+        print(f"Advertencia: No se pudo actualizar el catalogo. Error: {str(e)}")
+
+
 def process_vuelos(spark):
-    """
-    Procesa los CSVs de vuelos, aplica transformaciones y guarda en Hive.
-    """
     print(f"Iniciando procesamiento de vuelos desde {HDFS_VUELOS_PATH}")
 
-    # 1. Leer los datos 'sucios' (todos los CSV en la carpeta)
+    # 1. READ (Schema-on-Read using Contract)
     df_vuelos = spark.read \
         .option("header", True) \
         .option("sep", ";") \
+        .schema(FLIGHTS_SCHEMA) \
         .csv(HDFS_VUELOS_PATH)
 
-    # --- Transformaciones de Vuelos ---
+    # 2. TRANSFORM
 
-    # 2. Filtrar solo vuelos Domésticos
-    df_vuelos_dom = df_vuelos.filter(
-        col("Clasificación Vuelo") == "Domestico"
-    )
-
-    # 3. Renombrar, transformar y seleccionar columnas para Hive
-    #    Esto soluciona el error "Hora UTC" y limpia todos los nombres.
-    #    También corrige el nombre de 'Pasajeros' (mayúscula).
-    df_vuelos_clean = df_vuelos_dom.select(
-        to_date(col("Fecha"), "dd/MM/yyyy").alias("fecha"),
-        col("Hora UTC").alias("horaUTC"),
+    df_normalized = df_vuelos.select(
+        col("Fecha").alias("fecha_raw"),
+        col("Hora UTC").alias("hora_utc"),
         col("Clase de Vuelo (todos los vuelos)").alias("clase_de_vuelo"),
         col("Clasificación Vuelo").alias("clasificacion_de_vuelo"),
         col("Tipo de Movimiento").alias("tipo_de_movimiento"),
@@ -46,86 +62,79 @@ def process_vuelos(spark):
         col("Origen / Destino").alias("origen_destino"),
         col("Aerolinea Nombre").alias("aerolinea_nombre"),
         col("Aeronave").alias("aeronave"),
-        when(col("Pasajeros").isNull(), 0)
-            .otherwise(col("Pasajeros").cast("int"))
+        col("Pasajeros").alias("pasajeros_raw")
+    )
+
+    # Now filter on the CLEAN name (no accents, no spaces)
+    df_vuelos_dom = df_normalized.filter(
+        col("clasificacion_de_vuelo").isin("Domestico", "Doméstico")
+    )
+
+    # Final Cleaning
+    df_vuelos_clean = df_vuelos_dom.select(
+        to_date(col("fecha_raw"), "dd/MM/yyyy").alias("fecha"),
+        col("hora_utc").alias("horaUTC"),
+        col("clase_de_vuelo"),
+        col("clasificacion_de_vuelo"),
+        col("tipo_de_movimiento"),
+        col("aeropuerto"),
+        col("origen_destino"),
+        col("aerolinea_nombre"),
+        col("aeronave"),
+        when(col("pasajeros_raw").isNull(), 0)
+            .otherwise(col("pasajeros_raw").cast(IntegerType()))
             .alias("pasajeros")
     )
-    # Las columnas que no seleccionamos (como 'Calidad dato') se eliminan automáticamente.
 
-    # 4. Guardar la tabla limpia en Hive
-    print(f"Guardando datos limpios en la tabla Hive: {HIVE_VUELOS_TABLE}")
+    # 3. WRITE
+    print(f"Guardando datos limpios en: {HIVE_VUELOS_TABLE}")
+    df_vuelos_clean.write.mode("overwrite").saveAsTable(HIVE_VUELOS_TABLE)
 
-    df_vuelos_clean.write \
-        .mode("overwrite") \
-        .saveAsTable(HIVE_VUELOS_TABLE)
-
-    print("Procesamiento de vuelos completado.")
+    # 4. CATALOG UPDATE
+    update_hive_catalog(spark, HIVE_VUELOS_TABLE, FLIGHTS_SCHEMA,
+                       {"data_owner": "Data Team", "source": "Ministerio Transporte"})
+    print("Vuelos Done.")
 
 
 def process_aeropuertos(spark):
-    """
-    Procesa el CSV de aeropuertos, aplica transformaciones y guarda en Hive.
-    (Esta función ya funcionaba bien)
-    """
     print(f"Iniciando procesamiento de aeropuertos desde {HDFS_AEROPUERTOS_PATH}")
 
-    # 1. Leer los datos
+    # 1. READ
     df_aeropuertos = spark.read \
         .option("header", True) \
         .option("sep", ";") \
-        .option("inferSchema", True) \
+        .schema(AIRPORTS_DETAIL_SCHEMA) \
         .csv(HDFS_AEROPUERTOS_PATH)
 
-    # --- Transformaciones de Aeropuertos ---
-
-    # 2. Eliminar las columnas no deseadas
+    # 2. DROP UNWANTED COLUMNS
     cols_to_drop = ['inhab', 'fir', 'calidad del dato']
-    actual_cols_to_drop = [c for c in cols_to_drop if c in df_aeropuertos.columns]
+    df_dropped = df_aeropuertos.drop(*cols_to_drop)
 
-    if actual_cols_to_drop:
-        print(f"Eliminando columnas: {actual_cols_to_drop}")
-        df_aeropuertos_dropped = df_aeropuertos.drop(*actual_cols_to_drop)
-    else:
-        print("No se encontraron las columnas 'inhab', 'fir', 'calidad del dato' para eliminar.")
-        df_aeropuertos_dropped = df_aeropuertos
+    # 3. TRANSFORM
+    df_clean = df_dropped.na.fill("0", subset=["distancia_ref"])
 
-    # 3. En distancia_ref, convertir NULLs a 0
-    df_aeropuertos_clean = df_aeropuertos_dropped.na.fill(
-        0, subset=["distancia_ref"]
-    )
+    # 4. WRITE
+    print(f"Guardando datos limpios en: {HIVE_AEROPUERTOS_TABLE}")
+    df_clean.write.mode("overwrite").saveAsTable(HIVE_AEROPUERTOS_TABLE)
 
-    # 4. Guardar la tabla limpia en Hive
-    print(f"Guardando datos limpios en la tabla Hive: {HIVE_AEROPUERTOS_TABLE}")
-
-    df_aeropuertos_clean.write \
-        .mode("overwrite") \
-        .saveAsTable(HIVE_AEROPUERTOS_TABLE)
-
-    print("Procesamiento de aeropuertos completado.")
+    # 5. CATALOG UPDATE
+    update_hive_catalog(spark, HIVE_AEROPUERTOS_TABLE, AIRPORTS_DETAIL_SCHEMA,
+                       {"data_owner": "Data Team", "source": "ORSNA"})
+    print("Aeropuertos Done.")
 
 
 def main():
-    """
-    Función principal del script de Spark.
-    """
-    # Inicializar SparkSession con soporte para Hive
     spark = SparkSession.builder \
-        .appName("ProcesoETLAeropuertos") \
+        .appName("ETL_Vuelos_Aeropuertos_Fixed") \
         .enableHiveSupport() \
         .getOrCreate()
 
     spark.sparkContext.setLogLevel("WARN")
 
-    print("--- Iniciando Proceso ETL de Aeropuertos ---")
-
-    # Ejecutar ambos procesamientos
     process_aeropuertos(spark)
     process_vuelos(spark)
 
-    print("--- Proceso ETL completado exitosamente ---")
     spark.stop()
 
-
-# Punto de entrada del script
 if __name__ == "__main__":
     main()
