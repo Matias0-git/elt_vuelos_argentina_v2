@@ -23,9 +23,13 @@ El flujo de trabajo sigue este orden:
 Este repositorio está organizado para documentar cada etapa del pipeline.
 
 [Ingesta al Data Lake Hadoop](./bash/)
+
 [Procesamiento Spark](./spark/)
+
 [Orquestración Airflow](./airflow/)
+
 [Governanza](./data_contracts)
+
 [Hive Data Warehouse](./hive)
 
 
